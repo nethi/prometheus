@@ -15,7 +15,7 @@ This is a modified version of prometheus server that streams stats from customer
 There are two main components of this architecture:
 
 1. **Ztstas collector**: Which is a [modified prometheus server](https://github.com/zebrium/prometheus).
-2. **Zstats remote server**: This is the remote server, which will receive all the stats from Zstats collector. The code base for this is [here] (https://github.com/zebrium/prometheus-remote-server).
+2. **Zstats remote server**: This is the remote server, which will receive all the stats from Zstats collector. The code base for this is [here](https://github.com/zebrium/prometheus-remote-server).
 
 
 ![](https://github.com/zebrium/ze-images/blob/master/stats_architecture.png)
