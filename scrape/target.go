@@ -11,6 +11,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modifications copyright 2019 Zebrium Inc
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+
 package scrape
 
 import (
@@ -161,6 +168,15 @@ func (t *Target) DiscoveredLabels() labels.Labels {
 	defer t.mtx.Unlock()
 	lset := make(labels.Labels, len(t.discoveredLabels))
 	copy(lset, t.discoveredLabels)
+	return lset
+}
+
+// RawLabels returns a copy of the set of all the labels without __meta prefix, but includes __ prefix like __address.
+func (t *Target) RawLabels() labels.Labels {
+	lset := make(labels.Labels, 0, len(t.labels))
+	for _, l := range t.labels {
+		lset = append(lset, l)
+	}
 	return lset
 }
 

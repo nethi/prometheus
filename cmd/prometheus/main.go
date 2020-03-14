@@ -55,11 +55,13 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/scrape"
-	"github.com/prometheus/prometheus/storage"
-	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/storage/tsdb"
 	"github.com/prometheus/prometheus/util/strutil"
 	"github.com/prometheus/prometheus/web"
+
+	"github.com/prometheus/prometheus/zpacker"
+	"github.com/prometheus/prometheus/zqmgr"
+	"github.com/prometheus/prometheus/zstorage"
 )
 
 var (
@@ -119,6 +121,18 @@ func main() {
 		corsRegexString string
 
 		promlogConfig promlog.Config
+
+		// Zebrium specific command line options.
+		zebriumURL         string
+		zebriumInsecureSSL bool
+		zebriumToken       string
+		zebriumMqd         int
+		zebirumMispwreq    int
+		zebriumBufWaitSecs int
+		zebriumMQIScrapes  int
+		zebriumDepName     string
+		zebriumBufDir      string
+		zebriumMaxBufs     int
 	}{
 		notifier: notifier.Options{
 			Registerer: prometheus.DefaultRegisterer,
@@ -249,6 +263,18 @@ func main() {
 	a.Flag("query.max-samples", "Maximum number of samples a single query can load into memory. Note that queries will fail if they try to load more samples than this into memory, so this also limits the number of samples a query can return.").
 		Default("50000000").IntVar(&cfg.queryMaxSamples)
 
+	// Zebrium specific command line options.
+	a.Flag("zebrium.server-url", "Location of HTTPS server").Default("").StringVar(&cfg.zebriumURL)
+	a.Flag("zebrium.insecure-ssl", "Don't check SSL on HTTPS server").BoolVar(&cfg.zebriumInsecureSSL)
+	a.Flag("zebrium.zapi-token", "Token for authentication").Default("").StringVar(&cfg.zebriumToken)
+	a.Flag("zebrium.max-queue-depth", "Max number of in-flight HTTPS requests.").Default("1").IntVar(&cfg.zebriumMqd)
+	a.Flag("zebrium.max-instances-per-webreq", "Max number of instances to coelesce in a single HTTPS request.").Default("200").IntVar(&cfg.zebirumMispwreq)
+	a.Flag("zebrium.buffer-timeout-secs", "How many seconds should we buffer a collected instance data before sending to zebrium.").Default("10").IntVar(&cfg.zebriumBufWaitSecs)
+	a.Flag("zebrium.max-queued-scrapes-per-instance", "Max scrapes to buffer in memory per instance").Default("30").IntVar(&cfg.zebriumMQIScrapes)
+	a.Flag("zebrium.deployment-name", "Zebrium deployment name").Default("").StringVar(&cfg.zebriumDepName)
+	a.Flag("zebrium.local-buffer-dir", "Local directory where we can buffer samples for errors").Default("/prometheus").StringVar(&cfg.zebriumBufDir)
+	a.Flag("zebrium.max-file-buffers", "Max number of files to use for disk buffering in case of errors.").Default("10000").IntVar(&cfg.zebriumMaxBufs)
+
 	promlogflag.AddFlags(a, &cfg.promlogConfig)
 
 	_, err := a.Parse(os.Args[1:])
@@ -256,6 +282,34 @@ func main() {
 		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "Error parsing commandline arguments"))
 		a.Usage(os.Args[1:])
 		os.Exit(2)
+	}
+
+	if len(cfg.zebriumURL) == 0 {
+		zval, zok := os.LookupEnv("ZE_STATS_COLLECTOR_URL")
+		if zok && len(zval) > 0 {
+			cfg.zebriumURL = zval
+		}
+	}
+
+	if len(cfg.zebriumToken) == 0 {
+		zval, zok := os.LookupEnv("ZE_STATS_COLLECTOR_TOKEN")
+		if zok && len(zval) > 0 {
+			cfg.zebriumToken = zval
+		}
+	}
+
+	if len(cfg.zebriumDepName) == 0 {
+		zval, zok := os.LookupEnv("ZE_DEPLOYMENT_NAME")
+		if zok && len(zval) > 0 {
+			cfg.zebriumDepName = zval
+		} else {
+			cfg.zebriumDepName = "default"
+		}
+	}
+
+	zval, zok := os.LookupEnv("ZE_SAMPLE_BUF_DIR")
+	if zok && len(zval) > 0 {
+		cfg.zebriumBufDir = zval
 	}
 
 	logger := promlog.New(&cfg.promlogConfig)
@@ -336,14 +390,16 @@ func main() {
 	level.Info(logger).Log("vm_limits", prom_runtime.VmLimits())
 
 	var (
-		localStorage  = &tsdb.ReadyStorage{}
-		remoteStorage = remote.NewStorage(log.With(logger, "component", "remote"), prometheus.DefaultRegisterer, localStorage.StartTime, cfg.localStoragePath, time.Duration(cfg.RemoteFlushDeadline))
-		fanoutStorage = storage.NewFanout(logger, localStorage, remoteStorage)
+		// localStorage  = &tsdb.ReadyStorage{}
+		// remoteStorage = remote.NewStorage(log.With(logger, "component", "remote"), prometheus.DefaultRegisterer, localStorage.StartTime, cfg.localStoragePath, time.Duration(cfg.RemoteFlushDeadline))
+		// fanoutStorage = storage.NewFanout(logger, localStorage)
+		localStorage  = zstorage.NewZStore(logger)
+		fanoutStorage = localStorage
 	)
 
 	var (
-		ctxWeb, cancelWeb = context.WithCancel(context.Background())
-		ctxRule           = context.Background()
+		// ctxWeb, cancelWeb = context.WithCancel(context.Background())
+		ctxRule = context.Background()
 
 		notifierManager = notifier.NewManager(&cfg.notifier, log.With(logger, "component", "notifier"))
 
@@ -381,14 +437,16 @@ func main() {
 		})
 	)
 
-	cfg.web.Context = ctxWeb
-	cfg.web.TSDB = localStorage.Get
-	cfg.web.Storage = fanoutStorage
-	cfg.web.QueryEngine = queryEngine
-	cfg.web.ScrapeManager = scrapeManager
-	cfg.web.RuleManager = ruleManager
-	cfg.web.Notifier = notifierManager
-	cfg.web.TSDBCfg = cfg.tsdb
+	/*
+		cfg.web.Context = ctxWeb
+		cfg.web.TSDB = localStorage.Get
+		cfg.web.Storage = fanoutStorage
+		cfg.web.QueryEngine = queryEngine
+		cfg.web.ScrapeManager = scrapeManager
+		cfg.web.RuleManager = ruleManager
+		cfg.web.Notifier = notifierManager
+		cfg.web.TSDBCfg = cfg.tsdb
+	*/
 
 	cfg.web.Version = &web.PrometheusVersion{
 		Version:   version.Version,
@@ -411,8 +469,13 @@ func main() {
 		cfg.web.Flags[f.Name] = f.Value.String()
 	}
 
+	// Zebrium - initialization
+	zqmgr.InitQMgr(cfg.zebriumURL, cfg.zebriumInsecureSSL, cfg.zebriumToken, cfg.zebriumBufDir, cfg.zebriumMqd, cfg.zebirumMispwreq, cfg.zebriumBufWaitSecs, cfg.zebriumMQIScrapes, cfg.zebriumMaxBufs, logger)
+	zpacker.InitPacker(cfg.zebriumMQIScrapes, cfg.zebriumDepName)
+	defer zqmgr.StopQMgr()
+
 	// Depends on cfg.web.ScrapeManager so needs to be after cfg.web.ScrapeManager = scrapeManager.
-	webHandler := web.New(log.With(logger, "component", "web"), &cfg.web)
+	// webHandler := web.New(log.With(logger, "component", "web"), &cfg.web)
 
 	// Monitor outgoing connections on default transport with conntrack.
 	http.DefaultTransport.(*http.Transport).DialContext = conntrack.NewDialContextFunc(
@@ -420,8 +483,8 @@ func main() {
 	)
 
 	reloaders := []func(cfg *config.Config) error{
-		remoteStorage.ApplyConfig,
-		webHandler.ApplyConfig,
+		//remoteStorage.ApplyConfig,
+		//webHandler.ApplyConfig,
 		// The Scrape and notifier managers need to reload before the Discovery manager as
 		// they need to read the most updated config when receiving the new targets list.
 		scrapeManager.ApplyConfig,
@@ -501,8 +564,8 @@ func main() {
 					level.Warn(logger).Log("msg", "Received SIGTERM, exiting gracefully...")
 					reloadReady.Close()
 
-				case <-webHandler.Quit():
-					level.Warn(logger).Log("msg", "Received termination request via web service, exiting gracefully...")
+				//case <-webHandler.Quit():
+				//	level.Warn(logger).Log("msg", "Received termination request via web service, exiting gracefully...")
 				case <-cancel:
 					reloadReady.Close()
 					break
@@ -582,13 +645,13 @@ func main() {
 						if err := reloadConfig(cfg.configFile, logger, reloaders...); err != nil {
 							level.Error(logger).Log("msg", "Error reloading config", "err", err)
 						}
-					case rc := <-webHandler.Reload():
-						if err := reloadConfig(cfg.configFile, logger, reloaders...); err != nil {
-							level.Error(logger).Log("msg", "Error reloading config", "err", err)
-							rc <- err
-						} else {
-							rc <- nil
-						}
+					//case rc := <-webHandler.Reload():
+					//	if err := reloadConfig(cfg.configFile, logger, reloaders...); err != nil {
+					//		level.Error(logger).Log("msg", "Error reloading config", "err", err)
+					//		rc <- err
+					//	} else {
+					//		rc <- nil
+					//	}
 					case <-cancel:
 						return nil
 					}
@@ -622,7 +685,7 @@ func main() {
 
 				reloadReady.Close()
 
-				webHandler.Ready()
+				// webHandler.Ready()
 				level.Info(logger).Log("msg", "Server is ready to receive web requests.")
 				<-cancel
 				return nil
@@ -649,7 +712,7 @@ func main() {
 			},
 		)
 	}
-	{
+	/* {
 		// TSDB.
 		cancel := make(chan struct{})
 		g.Add(
@@ -695,8 +758,8 @@ func main() {
 				close(cancel)
 			},
 		)
-	}
-	{
+	} */
+	/* {
 		// Web handler.
 		g.Add(
 			func() error {
@@ -709,7 +772,7 @@ func main() {
 				cancelWeb()
 			},
 		)
-	}
+	} */
 	{
 		// Notifier.
 
@@ -732,6 +795,7 @@ func main() {
 			},
 		)
 	}
+	close(dbOpen)
 	if err := g.Run(); err != nil {
 		level.Error(logger).Log("err", err)
 		os.Exit(1)

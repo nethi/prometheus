@@ -11,6 +11,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modifications copyright 2019 Zebrium Inc
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+
 package scrape
 
 import (
@@ -23,6 +30,8 @@ import (
 	"io/ioutil"
 	"math"
 	"net/http"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -44,6 +53,8 @@ import (
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/pkg/value"
 	"github.com/prometheus/prometheus/storage"
+
+	"github.com/prometheus/prometheus/zpacker"
 )
 
 var (
@@ -148,6 +159,7 @@ func init() {
 	prometheus.MustRegister(targetScrapeSampleOutOfOrder)
 	prometheus.MustRegister(targetScrapeSampleOutOfBounds)
 	prometheus.MustRegister(targetScrapeCacheFlushForced)
+	zinit()
 }
 
 // scrapePool manages scrapes for sets of targets.
@@ -211,7 +223,7 @@ func newScrapePool(cfg *config.ScrapeConfig, app Appendable, jitterSeed uint64, 
 		cache := newScrapeCache()
 		opts.target.setMetadataStore(cache)
 
-		return newScrapeLoop(
+		return newZScrapeLoop(
 			ctx,
 			opts.scraper,
 			log.With(logger, "target", opts.target),
@@ -230,6 +242,7 @@ func newScrapePool(cfg *config.ScrapeConfig, app Appendable, jitterSeed uint64, 
 			cache,
 			jitterSeed,
 			opts.honorTimestamps,
+			opts.target,
 		)
 	}
 
@@ -1311,4 +1324,570 @@ func (sl *scrapeLoop) addReportSample(app storage.Appender, s string, t int64, v
 	default:
 		return err
 	}
+}
+
+// =============================================================================
+// New zscrape loop that talks to zpacker using the new interfaces and does NOT
+// send the samples to local tsdb.
+//
+// Every instance of scrape loop, gets one instance of zpacker instance, and talks to it.
+//  Everytime it scrapes a target:
+//   1. Starts a new batch() at the zpacker.
+//   2. For each sample it got in this scrape, it calls AddSample() to the zpacker.
+//   3. At the end of all samples if it is a successfull scrape, it calls CommitBatch() to the zpacker.
+//   4. At the end of all samples if it is a successfull scrape, it calls RollbackBatch() to the zpacker.
+//
+// =============================================================================
+
+func newZScrapeLoop(ctx context.Context,
+	sc scraper,
+	l log.Logger,
+	buffers *pool.Pool,
+	sampleMutator labelsMutator,
+	reportSampleMutator labelsMutator,
+	appender func() storage.Appender,
+	cache *scrapeCache,
+	jitterSeed uint64,
+	honorTimestamps bool,
+	ztgt *Target,
+) *zscrapeLoop {
+	if l == nil {
+		l = log.NewNopLogger()
+	}
+	if buffers == nil {
+		buffers = pool.New(1e3, 1e6, 3, func(sz int) interface{} { return make([]byte, 0, sz) })
+	}
+	if cache == nil {
+		cache = newScrapeCache()
+	}
+	sl := &zscrapeLoop{
+		scraper:             sc,
+		buffers:             buffers,
+		cache:               cache,
+		appender:            appender,
+		sampleMutator:       sampleMutator,
+		reportSampleMutator: reportSampleMutator,
+		stopped:             make(chan struct{}),
+		jitterSeed:          jitterSeed,
+		l:                   l,
+		parentCtx:           ctx,
+		honorTimestamps:     honorTimestamps,
+		ztgt:                ztgt,
+		zcadvisor:           false,
+	}
+	sl.ctx, sl.cancel = context.WithCancel(ctx)
+
+	return sl
+}
+
+type zscrapeLoop struct {
+	scraper         scraper
+	l               log.Logger
+	cache           *scrapeCache
+	lastScrapeSize  int
+	buffers         *pool.Pool
+	jitterSeed      uint64
+	honorTimestamps bool
+
+	appender            func() storage.Appender
+	sampleMutator       labelsMutator
+	reportSampleMutator labelsMutator
+
+	parentCtx context.Context
+	ctx       context.Context
+	cancel    func()
+	stopped   chan struct{}
+
+	ztgt      *Target
+	zlabels   labels.Labels
+	zignore   []string
+	zcadvisor bool
+}
+
+// Gets the zpacker instance for the given scrapeloop instance.
+func (sl *zscrapeLoop) getZpackerInstance(interval time.Duration) (*zpacker.ZPackIns, error) {
+	lset := sl.reportSampleMutator(labels.Labels{})
+	instance := lset.Get(labels.InstanceName)
+	if len(instance) == 0 {
+		err := fmt.Errorf("Failed to get scrape instance, no instance")
+		level.Warn(sl.l).Log("msg", err.Error())
+		return nil, err
+	}
+	job := lset.Get("job")
+	if len(job) == 0 {
+		err := fmt.Errorf("Failed to get scrape instance, no job")
+		level.Warn(sl.l).Log("msg", err.Error())
+		return nil, err
+	}
+	zpi, err := zpacker.Get(instance+"."+job, sl.l, interval)
+	if err != nil {
+		level.Warn(sl.l).Log("msg", "Failed to get zpacker instance", "err", err)
+		return nil, err
+	}
+
+	return zpi, nil
+}
+
+// Main zscrape loop.
+// Gets zpacker instance.
+//  while the target is active:
+//      scrape the target.
+//      Start a batch to the zpacker..
+//      Adds each scraped sample, one at a time to the zpacker.
+//      Commit the batch, or rollback if there is an error.
+//      Sleep ...
+// Puts the zpacker instance.
+func (sl *zscrapeLoop) run(interval, timeout time.Duration, errc chan<- error) {
+
+	select {
+	case <-time.After(sl.scraper.offset(interval, sl.jitterSeed)):
+		// Continue after a scraping offset.
+	case <-sl.ctx.Done():
+		close(sl.stopped)
+		return
+	}
+
+	var last time.Time
+
+	zpi, zerr := sl.getZpackerInstance(interval)
+	if zerr != nil {
+		select {
+		case <-sl.parentCtx.Done():
+			close(sl.stopped)
+			return
+		case <-sl.ctx.Done():
+			close(sl.stopped)
+			return
+		}
+	}
+
+	ticker := time.NewTicker(interval)
+	ois := int(interval.Seconds())
+	if ois == 0 {
+		ois = 1
+	}
+	cis := ois
+
+mainLoop:
+	for {
+		select {
+		case <-sl.parentCtx.Done():
+			zpi.Put()
+			close(sl.stopped)
+			ticker.Stop()
+			return
+		case <-sl.ctx.Done():
+			break mainLoop
+		default:
+		}
+
+		var (
+			start             = time.Now()
+			scrapeCtx, cancel = context.WithTimeout(sl.ctx, timeout)
+		)
+
+		// Only record after the first scrape.
+		if !last.IsZero() {
+			targetIntervalLength.WithLabelValues(interval.String()).Observe(
+				time.Since(last).Seconds(),
+			)
+		}
+
+		b := sl.buffers.Get(sl.lastScrapeSize).([]byte)
+		buf := bytes.NewBuffer(b)
+
+		contentType, scrapeErr := sl.scraper.scrape(scrapeCtx, buf)
+		cancel()
+
+		isok := false
+		if scrapeErr == nil {
+			b = buf.Bytes()
+			// NOTE: There were issues with misbehaving clients in the past
+			// that occasionally returned empty results. We don't want those
+			// to falsely reset our buffer size.
+			if len(b) > 0 {
+				sl.lastScrapeSize = len(b)
+				isok = true
+			}
+		} else {
+			level.Warn(sl.l).Log("msg", "Scrape failed", "err", scrapeErr.Error())
+			if errc != nil {
+				errc <- scrapeErr
+			}
+		}
+
+		if isok {
+			_, _, _, appErr := sl.zappend(b, contentType, start, zpi)
+			if appErr != nil {
+				level.Warn(sl.l).Log("msg", "append failed", "err", appErr)
+				if scrapeErr == nil {
+					scrapeErr = appErr
+				}
+			}
+		}
+
+		sl.buffers.Put(b)
+
+		last = start
+
+		mps := int(zpi.GetMPS())
+		if mps == 0 {
+			mps = ois
+		}
+		if cis < mps || (ois != cis && cis > mps) {
+			if mps < ois {
+				mps = ois
+			}
+			level.Info(sl.l).Log("msg", fmt.Sprintf("Changing scrape polling from %d to %d", cis, mps))
+			cis = mps
+			ticker.Stop()
+			ticker = time.NewTicker(time.Duration(cis) * time.Second)
+		}
+
+		select {
+		case <-sl.parentCtx.Done():
+			zpi.Put()
+			close(sl.stopped)
+			ticker.Stop()
+			return
+		case <-sl.ctx.Done():
+			break mainLoop
+		case <-ticker.C:
+		}
+	}
+
+	zpi.Put()
+	close(sl.stopped)
+	ticker.Stop()
+}
+
+// Stop the scraping. May still write data and stale markers after it has
+// returned. Cancel the context to stop all writes.
+func (sl *zscrapeLoop) stop() {
+	sl.cancel()
+	<-sl.stopped
+}
+
+// Fix the value to not include numbers as they change quite often, and can cause too much
+// churn on the backend.
+func zFixLabelValue(name string) string {
+	words := ZglInfo.name_re.Split(name, -1)
+	if len(words) == 0 {
+		return "_"
+	}
+
+	// If the first one has numbers, look for another word that does not have numbers.
+	sidx := 0
+	for sidx = 0; sidx < len(words); sidx++ {
+		if len(words[sidx]) > 0 && !ZglInfo.num_re.MatchString(words[sidx]) {
+			break
+		}
+	}
+	if sidx == len(words) {
+		return "_"
+	}
+
+	// We just take the first two words at most from sidx. and eliminate the second one, if it has digits.
+	cname := words[sidx]
+	if sidx+1 < len(words) && len(words[sidx+1]) > 0 {
+		if !ZglInfo.num_re.MatchString(words[sidx+1]) {
+			cname = cname + words[sidx+1]
+		}
+	}
+	return cname
+}
+
+// Add a label, so that we can use these labels to join with the labels
+// from the logs of those containers.
+func (sl *zscrapeLoop) zAddZlabel(dlset labels.Labels, dkey string, zkey string, fix bool) {
+	dv := dlset.Get(dkey)
+	if len(dv) > 0 {
+		if fix {
+			dv = zFixLabelValue(dv)
+		}
+		sl.zlabels = append(sl.zlabels, labels.Label{Name: zkey, Value: dv})
+	}
+}
+
+// Add extra labels specific to kubernetes, so that we can join stats
+// with logs for the same container or pod.
+func (sl *zscrapeLoop) zAddKubernetesLables(dlset labels.Labels) {
+
+	kv := dlset.Get("__meta_kubernetes_endpoints_name")
+	if len(kv) > 0 {
+		// role: endpoint target.
+		// ze_namespace: __meta_kubernetes_namespace
+		// ze_endpoints_name: __meta_kubernetes_endpoints_name
+		// ze_hostname (optional): __meta_kubernetes_endpoint_hostname
+		// ze_node_name (optional): __meta_kubernetes_endpoint_node_name
+		sl.zlabels = make(labels.Labels, 0)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_namespace", "zid_namespace_name", true)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_endpoints_name", "zid_endpoints_name", false)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_endpoint_node_name", "zid_node_name", false)
+		if len(dlset.Get("__meta_kubernetes_endpoint_hostname")) > 0 {
+			sl.zAddZlabel(dlset, "__meta_kubernetes_endpoint_hostname", "zid_host", false)
+		} else {
+			sl.zAddZlabel(dlset, "__meta_kubernetes_endpoint_node_name", "zid_host", false)
+		}
+		sl.zAddZlabel(dlset, "__meta_kubernetes_pod_name", "zid_pod_name", false)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_pod_container_name", "zid_container_name", true)
+		return
+	}
+
+	kv = dlset.Get("__meta_kubernetes_service_name")
+	if len(kv) > 0 {
+		// role: service.
+		// ze_service_name: __meta_kubernetes_service_name
+		// ze_namespace: __meta_kubernetes_namespace
+		sl.zlabels = make(labels.Labels, 0)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_service_name", "zid_service_name", false)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_namespace", "zid_namespace_name", true)
+		return
+	}
+
+	kv = dlset.Get("__meta_kubernetes_ingress_name")
+	if len(kv) > 0 {
+		// role: ingress.
+		// ze_namespace: __meta_kubernetes_namespace
+		// ze_ingress_name: __meta_kubernetes_endpoints_name
+		sl.zlabels = make(labels.Labels, 0)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_namespace", "zid_namespace_name", true)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_ingress_name", "zid_ingress_name", false)
+		return
+	}
+
+	kv = dlset.Get("__meta_kubernetes_pod_name")
+	if len(kv) > 0 {
+		// role: pod (aka container).
+		// ze_namespace: __meta_kubernetes_namespace
+		// ze_host_name: __meta_kubernetes_endpoints_name
+		// ze_pod_name: __meta_kubernetes_endpoint_hostname
+		// ze_container_name: __meta_kubernetes_endpoint_node_name
+		sl.zlabels = make(labels.Labels, 0)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_namespace", "zid_namespace_name", true)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_pod_node_name", "zid_host", false)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_pod_name", "zid_pod_name", false)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_pod_container_name", "zid_container_name", true)
+		return
+	}
+
+	kv = dlset.Get("__meta_kubernetes_node_name")
+	if len(kv) > 0 {
+		// role: node.
+		// ze_node_name: __meta_kubernetes_node_name
+		// ze_host_name: taken from instance.
+		sl.zlabels = make(labels.Labels, 0)
+		sl.zAddZlabel(dlset, "__meta_kubernetes_node_name", "zid_node_name", false)
+		sl.zAddZlabel(dlset, "instance", "zid_host", false)
+
+		rlbls := sl.ztgt.RawLabels()
+		if len(rlbls) > 0 {
+			addr := rlbls.Get(model.AddressLabel)
+			mpath := rlbls.Get(model.MetricsPathLabel)
+			if strings.Contains(addr, "kubernetes") && strings.Contains(mpath, "/metrics/cadvisor") {
+				sl.zcadvisor = true
+			}
+		}
+
+		return
+	}
+}
+
+// Add extra labels, so that we can use these labels to join with the labels
+// from the logs of those containers.
+func (sl *zscrapeLoop) zAddZlabels(lset labels.Labels) {
+	sl.zlabels = append(sl.zlabels, labels.Label{Name: "ze_deployment_name", Value: zpacker.GetDeploymentName()})
+
+	dlset := sl.ztgt.DiscoveredLabels()
+	sl.zAddKubernetesLables(dlset)
+
+	if len(sl.zlabels.Get("zid_namespace_name")) == 0 && len(dlset.Get("namespace")) > 0 {
+		sl.zAddZlabel(dlset, "namespace", "zid_namespace_name", false)
+	}
+
+	if len(sl.zlabels.Get("zid_pod_name")) == 0 {
+		if len(dlset.Get("podname")) > 0 {
+			sl.zAddZlabel(dlset, "podname", "zid_pod_name", false)
+		} else if len(dlset.Get("pod")) > 0 {
+			sl.zAddZlabel(dlset, "pod", "zid_pod_name", false)
+		}
+	}
+
+	if len(sl.zlabels.Get("zid_container_name")) == 0 {
+		if len(dlset.Get("container_name")) > 0 {
+			sl.zAddZlabel(dlset, "container_name", "zid_container_name", true)
+		} else if len(dlset.Get("container")) > 0 {
+			sl.zAddZlabel(dlset, "container", "zid_container_name", true)
+		}
+	}
+
+	if len(sl.zlabels.Get("zid_host")) == 0 {
+		if len(dlset.Get("hostname")) > 0 {
+			sl.zAddZlabel(dlset, "hostname", "zid_host", false)
+		} else if len(dlset.Get("host")) > 0 {
+			sl.zAddZlabel(dlset, "host", "zid_host", false)
+		}
+	}
+
+}
+
+func (sl *zscrapeLoop) zSampleMutator(olset labels.Labels) labels.Labels {
+	lset := sl.sampleMutator(olset)
+	if sl.zlabels == nil {
+		sl.zAddZlabels(lset)
+	}
+
+	if sl.zlabels != nil {
+		lb := labels.NewBuilder(lset)
+		for _, l := range sl.zlabels {
+			lb.Set(l.Name, l.Value)
+		}
+
+		if sl.zcadvisor {
+			nspc := lset.Get("namespace")
+			podname := lset.Get("pod_name")
+			if len(podname) == 0 {
+				podname = lset.Get("pod")
+			}
+			cname := lset.Get("container_name")
+			if len(cname) == 0 {
+				cname = lset.Get("container")
+			}
+			if len(nspc) > 0 {
+				lb.Set("zid_namespace_name", zFixLabelValue(nspc))
+			}
+			if len(podname) > 0 {
+				lb.Set("zid_pod_name", podname)
+			}
+			if len(cname) > 0 {
+				lb.Set("zid_container_name", zFixLabelValue(cname))
+			}
+		}
+
+		lset = lb.Labels()
+	}
+
+	if sl.zignore == nil {
+		if sl.zcadvisor {
+			sl.zignore = []string{"id", "pod", "pod_name", "image", "name", "dockerVersion", "kernelVersion", "osVersion"}
+		} else {
+			sl.zignore = make([]string, 0, len(lset))
+		}
+		for _, l := range sl.ztgt.Labels() {
+			if !olset.Has(l.Name) {
+				isok := true
+				for _, il := range sl.zignore {
+					if il == l.Name {
+						isok = false
+						break
+					}
+				}
+				if isok {
+					sl.zignore = append(sl.zignore, l.Name)
+				}
+			}
+		}
+	}
+
+	return lset
+}
+
+// Append a newly scraped data from a target.
+//      Start a batch to the zpacker..
+//      Adds each scraped sample, one at a time to the zpacker.
+//      Commit the batch, or rollback if there is an error.
+func (sl *zscrapeLoop) zappend(b []byte, contentType string, ts time.Time, zp *zpacker.ZPackIns) (total, added, seriesAdded int, err error) {
+	var (
+		p       = textparse.New(b, contentType)
+		defTime = timestamp.FromTime(ts)
+	)
+
+	ctp := "gauge"
+	chlp := ""
+	cunit := ""
+
+	zp.StartBatch(defTime)
+	for {
+		var et textparse.Entry
+		if et, err = p.Next(); err != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			break
+		}
+		switch et {
+		case textparse.EntryType:
+			_, mt := p.Type()
+			ctp = string(mt)
+			continue
+		case textparse.EntryHelp:
+			_, hb := p.Help()
+			chlp = string(hb)
+			continue
+		case textparse.EntryUnit:
+			continue
+		case textparse.EntryComment:
+			continue
+		default:
+		}
+		total++
+
+		t := defTime
+		met, tp, v := p.Series()
+		if !sl.honorTimestamps {
+			tp = nil
+		}
+		if tp != nil {
+			t = *tp
+		}
+
+		ce, ok := sl.cache.get(yoloString(met))
+		if ok {
+			zp.AddSample(ce.lset, ce.hash, t, v, chlp, ctp, cunit)
+		} else {
+			var lset labels.Labels
+
+			mets := p.Metric(&lset)
+			hash := lset.Hash()
+
+			// Hash label set as it is seen local to the target. Then add target labels
+			// and relabeling and store the final label set.
+			lset = sl.zSampleMutator(lset)
+
+			// The label set may be set to nil to indicate dropping.
+			if lset == nil {
+				continue
+			}
+
+			zp.AddSample(lset, hash, t, v, chlp, ctp, cunit)
+			sl.cache.addRef(mets, 0, lset, hash)
+			seriesAdded++
+		}
+		added++
+	}
+	if added == 0 {
+		zp.RollbackBatch()
+	} else {
+		zp.CommitBatch(sl.zignore)
+	}
+
+	// Only perform cache cleaning if the scrape was not empty.
+	// An empty scrape (usually) is used to indicate a failed scrape.
+	sl.cache.iterDone(len(b) > 0)
+
+	return total, added, seriesAdded, nil
+}
+
+// Global info.
+type ZGlInfo struct {
+	name_re *regexp.Regexp // Name regex.
+	num_re  *regexp.Regexp // Number regex.
+}
+
+var ZglInfo ZGlInfo
+
+// Initialize global regex.
+func zinit() {
+	ZglInfo.name_re = regexp.MustCompile("[^A-Za-z0-9]+")
+	ZglInfo.num_re = regexp.MustCompile("[0-9]+")
 }
