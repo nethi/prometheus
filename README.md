@@ -1,115 +1,111 @@
-# Prometheus
+# Zstats collector: A modified Prometheus server.
 
-[![Build Status](https://travis-ci.org/prometheus/prometheus.svg)][travis]
-[![CircleCI](https://circleci.com/gh/prometheus/prometheus/tree/master.svg?style=shield)][circleci]
-[![Docker Repository on Quay](https://quay.io/repository/prometheus/prometheus/status)][quay]
-[![Docker Pulls](https://img.shields.io/docker/pulls/prom/prometheus.svg?maxAge=604800)][hub]
-[![Go Report Card](https://goreportcard.com/badge/github.com/prometheus/prometheus)](https://goreportcard.com/report/github.com/prometheus/prometheus)
-[![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/486/badge)](https://bestpractices.coreinfrastructure.org/projects/486)
-[![fuzzit](https://app.fuzzit.dev/badge?org_id=prometheus&branch=master)](https://fuzzit.dev)
+This is a modified version of prometheus server that streams stats from customer's cluster to a remote server that is running in the cloud.
 
-Visit [prometheus.io](https://prometheus.io) for the full documentation,
-examples and guides.
+1. Stats are streamed realtime.
+2. Uses very little network bandwidth.
+3. It does not store stats locally (no tsdb).
+3. Every sample scraped locally will reach the remote server. (i.e no dropping of stats because of timestamp ordering issues).
+4. Adds extra labels, that can be used to join these collected stats with the logs. Please see our log collector which adds similar labels here (https://github.com/zebrium/ze-kubernetes-collector)
+5. Accepts the standard prometheus config file and customers can just point their existing prometheus config file to this server.
 
-Prometheus, a [Cloud Native Computing Foundation](https://cncf.io/) project, is a systems and service monitoring system. It collects metrics
-from configured targets at given intervals, evaluates rule expressions,
-displays the results, and can trigger alerts if some condition is observed
-to be true.
-
-Prometheus's main distinguishing features as compared to other monitoring systems are:
-
-- a **multi-dimensional** data model (timeseries defined by metric name and set of key/value dimensions)
-- a **flexible query language** to leverage this dimensionality
-- no dependency on distributed storage; **single server nodes are autonomous**
-- timeseries collection happens via a **pull model** over HTTP
-- **pushing timeseries** is supported via an intermediary gateway
-- targets are discovered via **service discovery** or **static configuration**
-- multiple modes of **graphing and dashboarding support**
-- support for hierarchical and horizontal **federation**
 
 ## Architecture overview
 
-![](https://cdn.jsdelivr.net/gh/prometheus/prometheus@c34257d069c630685da35bcef084632ffd5d6209/documentation/images/architecture.svg)
+There are two main components of this architecture:
+
+1. ztstas collector: Which is a modified prometheus server. It is this code base (https://github.com/zebrium/prometheus).
+2. Zstats remote server: This is the remote server, which will receive all the stats from Zstats collector. The code base for this is at https://github.com/zebrium/prometheus-remote-server.
+
+Here is how one can use this stack for anomaly detection:
+
+
+![](https://github.com/zebrium/ze-images/blob/master/stats_architecture.png)
+
+This github project is about Zstats collector, which is a modified prometheus server as mentioned above.
+
+### What changes did we make to the Prometheus server:
+We have kept the scrapper, service discovery and config parser modules and removed all other modules (yes, no local storage).
+
+We have added three new modules called zpacker, zcacher and zqmgr modules that does all the magic of sending metrics efficiently over the network in real time without loosing any information.
+
+#### Architecture of customized Prometheus server
+
+![](https://github.com/zebrium/ze-images/blob/master/stats_collector_architecture.png)
+
+##### Here is our basic idea
+1. As we scrape a target, we want to send that data immediately to the remote side.
+2. The scraped data from a target is like a blob of data that has a set of various metrics and their values with a particular time stamp along with the labels and values.
+3. We want to send this blob as efficiently as possible over the wire. This blob contains a set of samples but only one sample of each metric from the scraped target. The number of metrics can change from one scrape to the next scrape as it is up to the exporter on what it provides in each scrape.
+4. We want to batch as many blobs as possible into a single request to send over the wire without adding too much latency. This reduces the number of requests that we need to handle on our remote server side.
+5. On the remote server side, from the blob(s), we will reconstruct the data as if we scraped the target locally.
+6. Every sample that is scraped reaches our remote server with no drops because of out-of-order samples.
+
+
+##### How we do the encoding of blob over the wire:
+Each scraped blob contains a set of metrics. Each metric contains: help string, type information, metric name, metric labels, metric values, one time stamp, one value of that sample. Prometheus supports two basic types of metrics: 1) monotonically increasing counters, and 2) gauges with a value that can arbitrarily go down or up and by extension Summary (set of gauges) and Histogram (set-of counters). The basic idea is, if we have to send the blob as is, even after compression, it is lot of data over the wire. But if we do the diff of the blob with the blob that we scraped last time from this target, that diff will be very small. We call this diff an incremental blob. This incremental blob is computed as follows:
+1. Metric's sample value is diff'd from its last sample value. This difference will be very small or zero in most cases and can be encoded efficiently with variable byte encoding.
+2. If the diff value is zero, when the sample value does not change, we skip sending this metric completely in our incremental blob.
+3. We also do the diff of the time stamp and do variable byte encoding.
+4. If the time stamp is the same across all the metrics of a blob, we detect that and send the timestamp once in the incremental blob instead of per sample.
+5. Incremental blob does NOT contain the metric name.
+6. Incremental blob does NOT contain the metric's help string.
+7. Incremental blob does NOT contain any of the labels or any of the values.
+
+Incremental blob contains the data of the samples that changed from the last time we scraped and on top of that we do all the above mentioned optimizations to reduce the size. On the remote server side, given the incremental blob we should be able to reconstruct the original full blob.
+
+We keep the state between remote server and stats collector as independent as possible, something like a NFS file handle approach. The state is divided between stats collector and remote server as follows:
+1. It is the responsibility of the stats collector to detect that some schema has changed between the last blob and the current blob. This can happen, for example, when we see a new sample this time which did not exist last time or the scraped target came online for the first time. When the stats collector detects this it will NEVER send the incremental blob. Instead it will send the full blob with everything.
+2. Stats collector always creates a full blob in addition to the incremental blob if there is one. However, the stats collector does not send the full blob over the wire if the incremental blob is available to start with. 
+3. If the remote server for any reason cannot reconstruct the full blob from the incremental blob, it will ask the stats collector to send the full blob. This can happen, if the remote server did not find the last blob in its cache either because the remote server process crashed and came back up or it purged the last blob because of memory pressure.
+
+Sending one request to remote server for each blob is quite expensive in terms of the number of HTTP requests. So, we coalesce blobs either incremental or full blobs across all the targets and send them in one request. If the scraping interval is too small, we also coalesce blobs from the same target in one request. Each blob either, incremental or full, is also compressed before sending on the wire.
+
+We have added three modules to the Prometheus server: zpacker, zcacher, zqmgr
+1. Scraper module scrapes the targets periodically from each target. Each time it scrapes from one target, it sends that scraped data to zapcker module. 
+2. zpacker (Zebrium packer) module is responsible for buffering and creating two blobs (full, incremental) out of the data that scraper sends.
+3. zcacher (Zebrium cacher) module is responsible for caching the last blob.
+4. zqmgr (Zebrium queue manager) module is responsible for connection management and coalescing of blobs and sending the HTTP requests to the remote server.
+
 
 ## Install
 
-There are various ways of installing Prometheus.
+### Prepackaged container
 
-### Precompiled binaries
+If you want to install the zebrium prepackaged container, that sends the stats to our cloud software for anomaly detection, Instructions are here https://github.com/zebrium/ze-stats.
 
-Precompiled binaries for released versions are available in the
-[*download* section](https://prometheus.io/download/)
-on [prometheus.io](https://prometheus.io). Using the latest production release binary
-is the recommended way of installing Prometheus.
-See the [Installing](https://prometheus.io/docs/introduction/install/)
-chapter in the documentation for all the details.
-
-Debian packages [are available](https://packages.debian.org/sid/net/prometheus).
-
-### Docker images
-
-Docker images are available on [Quay.io](https://quay.io/repository/prometheus/prometheus) or [Docker Hub](https://hub.docker.com/r/prom/prometheus/).
-
-You can launch a Prometheus container for trying it out with
-
-    $ docker run --name prometheus -d -p 127.0.0.1:9090:9090 prom/prometheus
-
-Prometheus will now be reachable at http://localhost:9090/.
 
 ### Building from source
 
 To build Prometheus from the source code yourself you need to have a working
 Go environment with [version 1.13 or greater installed](https://golang.org/doc/install).
-You will also need to have [Node.js](https://nodejs.org/) and [Yarn](https://yarnpkg.com/)
+You will also need to have [Node.js](https://nodejs.org/), [go-kit](https://github.com/go-kit/kit) and [Yarn](https://yarnpkg.com/)
 installed in order to build the frontend assets.
 
-You can directly use the `go` tool to download and install the `prometheus`
-and `promtool` binaries into your `GOPATH`:
-
-    $ go get github.com/prometheus/prometheus/cmd/...
-    $ prometheus --config.file=your_config.yml
-
-*However*, when using `go get` to build Prometheus, Prometheus will expect to be able to
-read its web assets from local filesystem directories under `web/ui/static` and
-`web/ui/templates`. In order for these assets to be found, you will have to run Prometheus
-from the root of the cloned repository. Note also that these directories do not include the
-new experimental React UI unless it has been built explicitly using `make assets` or `make build`.
-
-You can also clone the repository yourself and build using `make build`, which will compile in
-the web assets so that Prometheus can be run from anywhere:
+You can clone the repository yourself and build using the instructions mentioned below, which will compile and generate prometheus binary that can be run from anywhere:
 
     $ mkdir -p $GOPATH/src/github.com/prometheus
     $ cd $GOPATH/src/github.com/prometheus
-    $ git clone https://github.com/prometheus/prometheus.git
+    $ git clone https://github.com/zebrium/prometheus.git
     $ cd prometheus
     $ make build
-    $ ./prometheus --config.file=your_config.yml
+    $ ./prometheus --zebrium.insecure-ssl  --zebrium.server-url="http://127.0.0.1:9905/api/v1/zstats"  --zebrium.zapi-token=0 --zebrium.local-buffer-dir="/tmp/prom/" --config.file=your_config.yml
 
-The Makefile provides several targets:
-
-  * *build*: build the `prometheus` and `promtool` binaries (includes building and compiling in web assets)
-  * *test*: run the tests
-  * *test-short*: run the short tests
-  * *format*: format the source code
-  * *vet*: check the source code for common errors
-  * *docker*: build a docker container for the current `HEAD`
+Prometheus binary takes these new arguments:
+    * --zebrium.insecure-ssl : If passed, it uses http instead of https.
+    * --zebrium.server-url : remote server url to send stats to.
+    * --zebrium.zapi-token: Token for authentication.
+    * --zebrium.local-buffer-dir: local directory to use for buffering stats, when the remote server is unavailable for a short period of time.
 
 ## More information
 
-  * The source code is periodically indexed: [Prometheus Core](https://godoc.org/github.com/prometheus/prometheus).
-  * You will find a Travis CI configuration in `.travis.yml`.
-  * See the [Community page](https://prometheus.io/community) for how to reach the Prometheus developers and users on various communication channels.
-
-## Contributing
-
-Refer to [CONTRIBUTING.md](https://github.com/prometheus/prometheus/blob/master/CONTRIBUTING.md)
+  * Link to zebrium Blog: TODO 
 
 ## License
 
 Apache License 2.0, see [LICENSE](https://github.com/prometheus/prometheus/blob/master/LICENSE).
 
-
-[travis]: https://travis-ci.org/prometheus/prometheus
-[hub]: https://hub.docker.com/r/prom/prometheus/
-[circleci]: https://circleci.com/gh/prometheus/prometheus
-[quay]: https://quay.io/repository/prometheus/prometheus
+## Contributors
+* Anil Nanduri (Zebrium)
+* Dara Hazeghi (Zebrium)
+* Brady Zuo (Zebrium)
