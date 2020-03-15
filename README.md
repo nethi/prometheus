@@ -70,7 +70,7 @@ We have added three modules to the Prometheus server: zpacker, zcacher, zqmgr
 
 ### Prepackaged container
 
-If you want to install the zebrium prepackaged container, that sends the stats to our cloud software for anomaly detection, Instructions are here https://github.com/zebrium/ze-stats.
+If you want to install the zebrium prepackaged container, that sends the stats to our cloud software for anomaly detection, Instructions are [here](https://github.com/zebrium/ze-stats) https://github.com/zebrium/ze-stats.
 
 
 ### Building from source
