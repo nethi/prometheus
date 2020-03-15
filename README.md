@@ -1,4 +1,4 @@
-# Zstats collector: A modified Prometheus server. (Still being edited)
+# Zstats collector: A modified Prometheus server.
 
 This is a modified version of prometheus server that streams stats from customer's cluster to a remote server that is running in the cloud.
 
