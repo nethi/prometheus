@@ -95,6 +95,12 @@ Prometheus binary takes these new arguments:
 * --zebrium.zapi-token: Token for authentication.
 * --zebrium.local-buffer-dir: local directory to use for buffering stats, when the remote server is unavailable for a short period of time.
 
+Here is the sample command, that streams stats to zstats remote server running at http://127.0.0.1:9905/api/v1/zstats
+```
+    $ ./prometheus --zebrium.insecure-ssl  --zebrium.server-url="http://127.0.0.1:9905/api/v1/zstats"  --zebrium.zapi-token=0 --zebrium.local-buffer-dir="/tmp/prom/" --config.file=your_config.yml
+```
+
+
 ## More information
 
   * Link to zebrium Blog: TODO 
