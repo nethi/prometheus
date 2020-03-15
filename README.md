@@ -100,6 +100,8 @@ Here is the sample command, that streams stats to zstats remote server running a
     $ ./prometheus --zebrium.insecure-ssl  --zebrium.server-url="http://127.0.0.1:9905/api/v1/zstats"  --zebrium.zapi-token=0 --zebrium.local-buffer-dir="/tmp/prom/" --config.file=your_config.yml
 ```
 
+For running the zstats remote server, please see [here](https://github.com/zebrium/prometheus-remote-server)
+
 
 ## More information
 
