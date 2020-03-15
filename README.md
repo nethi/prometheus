@@ -75,7 +75,7 @@ If you want to install the zebrium prepackaged container, that sends the stats t
 
 ### Building from source
 
-To build Prometheus from the source code yourself, you need to have a working
+To build Zstats collector from the source code yourself, you need to have a working
 Go environment with [version 1.13 or greater installed](https://golang.org/doc/install).
 You will also need to have [Node.js](https://nodejs.org/), [go-kit](https://github.com/go-kit/kit) and [Yarn](https://yarnpkg.com/)
 installed in order to build the frontend assets.
