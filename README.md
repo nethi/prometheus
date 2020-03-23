@@ -120,7 +120,7 @@ For running the zstats remote server, please see [here](https://github.com/zebri
 
 ## More information
 
-  * Link to zebrium Blog: TODO 
+  * Check out our [Blog](https://www.zebrium.com/blog/a-prometheus-fork-for-efficient-cloud-scale-autonomous-monitoring) 
 
 ## License
 
