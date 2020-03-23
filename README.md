@@ -64,12 +64,12 @@ Sending one request to the remote server for each blob is quite expensive in ter
 
 If the scraping interval is too small, we also coalesce blobs from the same target in one request. Each blob, either incremental or full, is also compressedbefore sending on the wire.
 
-on the remote server side, given the incremental blob we should be able to reconstruct the original full blob.
+On the remote server side, given the incremental blob we should be able to reconstruct the original full blob.
 
 We keep the state between remote server and stats collector as independent as possible, something like a NFS file handle approach. The state is divided between stats collector and remote server as follows:
-1. It is the responsibility of the stats collector to detect that some schema has changed between the last blob and the current blob. This can happen, for example, when we see a new sample this time which did not exist last time or the scraped target came online for the first time. When the stats collector detects this it will NEVER send the incremental blob. Instead it will send the full blob with everything.
-2. Stats collector always creates a full blob in addition to the incremental blob if there is one. However, the stats collector does not send the full blob over the wire if the incremental blob is available to start with. 
-3. If the remote server for any reason cannot reconstruct the full blob from the incremental blob, it will ask the stats collector to send the full blob. This can happen, if the remote server did not find the last blob in its cache either because the remote server process crashed and came back up or it purged the last blob because of memory pressure.
+1. It is the responsibility of the metrics collector to detect that some schema has changed between the last blob and the current blob. This can happen, for example, when we see a new sample this time which did not exist last time or the scraped target came online for the first time. When the stats collector detects this it will NEVER send the incremental blob. Instead it will send the full blob with everything.
+2. Metrics collector always creates a full blob in addition to the incremental blob if there is one. However, the metrics collector does not send the full blob over the wire if the incremental blob is available to start with. 
+3. If the remote server for any reason cannot reconstruct the full blob from the incremental blob, it will ask the metrics collector to send the full blob. This can happen, if the remote server did not find the last blob in its cache either because the remote server process crashed and came back up or it purged the last blob because of memory pressure.
 
 Sending one request to remote server for each blob is quite expensive in terms of the number of HTTP requests. So, we coalesce blobs either incremental or full blobs across all the targets and send them in one request. If the scraping interval is too small, we also coalesce blobs from the same target in one request. Each blob either, incremental or full, is also compressed before sending on the wire.
 
@@ -84,7 +84,7 @@ We have added three modules to the Prometheus server: zpacker, zcacher, zqmgr
 
 ### Prepackaged container
 
-If you want to install the zebrium prepackaged container, that sends the stats to our cloud software for anomaly detection, Instructions are [here](https://github.com/zebrium/ze-stats) https://github.com/zebrium/ze-stats.
+If you want to install the zebrium prepackaged container, that sends the metrics to our cloud software for anomaly detection, Instructions are [here](https://github.com/zebrium/ze-stats) https://github.com/zebrium/ze-stats.
 
 
 ### Building from source
@@ -105,11 +105,11 @@ You can clone the repository yourself and build using the instructions mentioned
 
 Prometheus binary takes these new arguments:
 * --zebrium.insecure-ssl : If passed, it uses http instead of https.
-* --zebrium.server-url : remote server url to send stats to.
+* --zebrium.server-url : remote server url to send metrics to.
 * --zebrium.zapi-token: Token for authentication.
-* --zebrium.local-buffer-dir: local directory to use for buffering stats, when the remote server is unavailable for a short period of time.
+* --zebrium.local-buffer-dir: local directory to use for buffering metrics, when the remote server is unavailable for a short period of time.
 
-Here is the sample command, that streams stats to zstats remote server running at http://127.0.0.1:9905/api/v1/zstats
+Here is the sample command, that streams metrics to zstats remote server running at http://127.0.0.1:9905/api/v1/zstats
 ```
     $ ./prometheus --zebrium.insecure-ssl  --zebrium.server-url="http://127.0.0.1:9905/api/v1/zstats"  --zebrium.zapi-token=0 --zebrium.local-buffer-dir="/tmp/prom/" --config.file=your_config.yml
 ```
