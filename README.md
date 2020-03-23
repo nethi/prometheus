@@ -1,8 +1,8 @@
 # Zstats collector: A modified Prometheus server.
 
-This is a forked and modified version of [Prometheus](https://prometheus.io/) server that efficiently streams metrics from a user’s cluster to a remote server that is running in the cloud. This project came out of a need to augment [Zebrium’s autonomous monitoring](https://www.zebrium.com) service by correlating log anomalies with anomalies detected within a group of related metrics. 
+This is a forked and modified version of [Prometheus](https://prometheus.io/) server that efficiently streams metrics from a user’s cluster to a remote server that is running in the cloud. This project came out of a need to augment [Zebrium’s autonomous monitoring service](https://www.zebrium.com) by correlating log anomalies with anomalies detected within a group of related metrics. 
 
-You can read all about what we have done in this blog. 
+You can read all about what we have done in [this blog](https://www.zebrium.com/blog/a-prometheus-fork-for-efficient-cloud-scale-autonomous-monitoring). 
 
 Quick summary:
 1. Metrics are streamed realtime.
