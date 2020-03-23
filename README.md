@@ -8,7 +8,7 @@ Quick summary:
 1. Metrics are streamed realtime.
 2. Uses very little network bandwidth (testing shows 500x reduction over raw).
 3. It does not store metrics locally (no TSDB).
-3. Every sample scraped locally will reach the remote server. (i.e no dropping of metrics because of timestamp ordering issues).
+3. Every sample scraped locally will reach the remote server (i.e no dropping of metrics because of timestamp ordering issues).
 4. Adds extra labels, that can be used to join these collected metrics with the logs. Please see our log collector which adds similar labels [here](https://github.com/zebrium/ze-kubernetes-collector)
 
 ## Architecture overview
