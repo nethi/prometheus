@@ -7,8 +7,6 @@ This is a modified version of prometheus server that streams metrics from custom
 3. It does not store metrics locally (no tsdb).
 3. Every sample scraped locally will reach the remote server. (i.e no dropping of metrics because of timestamp ordering issues).
 4. Adds extra labels, that can be used to join these collected metrics with the logs. Please see our log collector which adds similar labels [here](https://github.com/zebrium/ze-kubernetes-collector)
-5. Accepts the standard prometheus config file and customers can just point their existing prometheus config file to this server.
-
 
 ## Architecture overview
 
