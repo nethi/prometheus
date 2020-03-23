@@ -5,8 +5,8 @@ This is a modified version of prometheus server that streams metrics from custom
 1. Metrics are streamed realtime.
 2. Uses very little network bandwidth.
 3. It does not store metrics locally (no tsdb).
-3. Every sample scraped locally will reach the remote server. (i.e no dropping of stats because of timestamp ordering issues).
-4. Adds extra labels, that can be used to join these collected stats with the logs. Please see our log collector which adds similar labels [here](https://github.com/zebrium/ze-kubernetes-collector)
+3. Every sample scraped locally will reach the remote server. (i.e no dropping of metrics because of timestamp ordering issues).
+4. Adds extra labels, that can be used to join these collected metrics with the logs. Please see our log collector which adds similar labels [here](https://github.com/zebrium/ze-kubernetes-collector)
 5. Accepts the standard prometheus config file and customers can just point their existing prometheus config file to this server.
 
 
@@ -15,7 +15,7 @@ This is a modified version of prometheus server that streams metrics from custom
 There are two main components of this architecture:
 
 1. **Zstats collector**: Which is a [modified prometheus server](https://github.com/zebrium/prometheus).
-2. **Zstats remote server**: This is the remote server, which will receive all the stats from Zstats collector. The code base for this is [here](https://github.com/zebrium/prometheus-remote-server).
+2. **Zstats remote server**: This is the remote server, which will receive all the metrics from Zstats collector. The code base for this is [here](https://github.com/zebrium/prometheus-remote-server).
 
 
 ![](https://github.com/zebrium/ze-images/blob/master/stats_architecture.png)
