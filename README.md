@@ -1,10 +1,10 @@
 # Zstats collector: A modified Prometheus server.
 
-This is a modified version of prometheus server that streams stats from customer's cluster to a remote server that is running in the cloud.
+This is a modified version of prometheus server that streams metrics from customer's cluster to a remote server that is running in the cloud.
 
-1. Stats are streamed realtime.
+1. Metrics are streamed realtime.
 2. Uses very little network bandwidth.
-3. It does not store stats locally (no tsdb).
+3. It does not store metrics locally (no tsdb).
 3. Every sample scraped locally will reach the remote server. (i.e no dropping of stats because of timestamp ordering issues).
 4. Adds extra labels, that can be used to join these collected stats with the logs. Please see our log collector which adds similar labels [here](https://github.com/zebrium/ze-kubernetes-collector)
 5. Accepts the standard prometheus config file and customers can just point their existing prometheus config file to this server.
