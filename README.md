@@ -41,7 +41,14 @@ We have added three new modules called zpacker, zcacher and zqmgr modules that d
 
 
 ##### Encoding of blob over the wire:
-Each scraped blob contains a set of metrics. Each metric contains: help string, type information, metric name, metric labels, metric values, one time stamp, one value of that sample. Prometheus supports two basic types of metrics: 1) monotonically increasing counters, and 2) gauges with a value that can arbitrarily go down or up and by extension Summary (set of gauges) and Histogram (set-of counters). The basic idea is, if we have to send the blob as is, even after compression, it is lot of data over the wire. But if we do the diff of the blob with the blob that was scraped last time from this target, that diff will be very small. We call this diff an incremental blob. This incremental blob is computed as follows:
+Each scraped blob contains a set of metrics. Each metric contains: 
+1. help string
+2. type information
+3. metric name
+4. metric label/value pairs
+5. one time stamp
+6. one value of that sample
+The basic idea is, if we have to send the blob as is, even after compression, it still represents a lot of data going over the wire. But if we do the diff of the blob with the blob that was scraped last time from this target, that diff will be very small. We call this diff an incremental blob. This incremental blob is computed as follows:
 1. Metric's sample value is diff'd from its last sample value. This difference will be very small or zero in most cases and can be encoded efficiently with variable byte encoding.
 2. If the diff value is zero, when the sample value does not change, we skip sending this metric completely in our incremental blob.
 3. We also do the diff of the time stamp and do variable byte encoding.
@@ -50,7 +57,13 @@ Each scraped blob contains a set of metrics. Each metric contains: help string, 
 6. Incremental blob does NOT contain the metric's help string.
 7. Incremental blob does NOT contain any of the labels or any of the values.
 
-Incremental blob contains the data of the samples that changed from the last time we scraped, and on top of that we do all the above mentioned optimizations to reduce the size. On the remote server side, given the incremental blob we should be able to reconstruct the original full blob.
+One can see tha the incremental blob contains the data of the samples that changed from the last time we scraped and on top of that we do all the above mentioned optimizations to reduce the size. 
+
+Sending one request to the remote server for each blob is quite expensive in terms of the number of HTTP requests. So, we coalesce blobs, either incremental or full blobs, across all the targets and send them in one request. 
+
+If the scraping interval is too small, we also coalesce blobs from the same target in one request. Each blob, either incremental or full, is also compressedbefore sending on the wire.
+
+on the remote server side, given the incremental blob we should be able to reconstruct the original full blob.
 
 We keep the state between remote server and stats collector as independent as possible, something like a NFS file handle approach. The state is divided between stats collector and remote server as follows:
 1. It is the responsibility of the stats collector to detect that some schema has changed between the last blob and the current blob. This can happen, for example, when we see a new sample this time which did not exist last time or the scraped target came online for the first time. When the stats collector detects this it will NEVER send the incremental blob. Instead it will send the full blob with everything.
