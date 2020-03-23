@@ -48,6 +48,7 @@ Each scraped blob contains a set of metrics. Each metric contains:
 4. metric label/value pairs
 5. one time stamp
 6. one value of that sample
+
 The basic idea is, if we have to send the blob as is, even after compression, it still represents a lot of data going over the wire. But if we do the diff of the blob with the blob that was scraped last time from this target, that diff will be very small. We call this diff an incremental blob. This incremental blob is computed as follows:
 1. Metric's sample value is diff'd from its last sample value. This difference will be very small or zero in most cases and can be encoded efficiently with variable byte encoding.
 2. If the diff value is zero, when the sample value does not change, we skip sending this metric completely in our incremental blob.
