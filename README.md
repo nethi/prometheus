@@ -34,10 +34,10 @@ We have added three new modules called zpacker, zcacher and zqmgr modules that d
 ##### Basic idea
 1. As we scrape a target, we want to send that data immediately to the remote side.
 2. The scraped data from a target is like a blob of data that has a set of various metrics and their values with a particular timestamp along with the labels and values.
-3. We want to send this blob as efficiently as possible over the wire. This blob contains a set of samples, but only one sample of each metric from the scraped target. The number of metrics can change from one scrape to the next scrape as it is up to the exporter on what it provides in each scrape.
+3. We want to send this blob as efficiently as possible over the wire. This blob contains a set of samples but only one sample of each metric from the scraped target. The number of metrics can change from one scrape to the next scrape as it is up to the exporter on what it provides in each scrape.
 4. We want to batch as many blobs as possible into a single request to send over the wire without adding too much latency. This reduces the number of requests that we need to handle on our remote server side.
 5. On the remote server side, from the blob(s), we will reconstruct the data as if we scraped the target locally.
-6. Every sample that is scraped reaches our remote server without any drops because of out-of-order samples.
+6. Every sample that is scraped reaches our remote server without any drops due to out-of-order samples.
 
 
 ##### Encoding of blob over the wire:
