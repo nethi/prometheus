@@ -11,6 +11,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// zpacker (Zebrium packer) module is responsible for buffering and creating
+// two blobs (full, incremental) out of the data that scraper sends.
+
 package zpacker
 
 import (
